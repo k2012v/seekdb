@@ -16,9 +16,12 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_expr_ai_rerank.h"
+#include <algorithm>
+#include <cmath>
 #include "query/ai/ob_ai_endpoint_resolver.h"
 #include "share/rc/ob_server_runtime.h"
 #include "lib/utility/utility.h"
+#include "lib/utility/ob_sort.h"
 #include "common/json_type/ob_json_common.h"
  
 using namespace oceanbase::common;
@@ -77,7 +80,6 @@ int ObExprAIRerank::calc_result_typeN(ObExprResType &type,
     } else if (param_num == 4) {
       ObObjType doc_key_type = types_stack[DOC_KEY_IDX].get_type();
       if (doc_key_type == ObNullType) {
-      } else if (doc_key_type == ObJsonType) {
       } else if (ob_is_string_type(doc_key_type)) {
         types_stack[DOC_KEY_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
       } else {  
@@ -101,10 +103,15 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
   ObDatum *arg_query = nullptr;
   ObDatum *arg_documents = nullptr;
   ObDatum *arg_doc_key = nullptr;
-  if (OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_query, arg_documents, arg_doc_key))) {
-  } else if (arg_model_id->is_null() || arg_query->is_null() || arg_documents->is_null()) {
+  if (OB_FAIL(expr.arg_cnt_ == 4
+                  ? expr.eval_param_value(ctx, arg_model_id, arg_query, arg_documents, arg_doc_key)
+                  : expr.eval_param_value(ctx, arg_model_id, arg_query, arg_documents))) {
+  } else if (OB_ISNULL(arg_model_id) || arg_model_id->is_null()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, model id or query or documents is null");
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, model id is null");
+    res.set_null();
+  } else if (OB_ISNULL(arg_query) || arg_query->is_null()
+      || OB_ISNULL(arg_documents) || arg_documents->is_null()) {
     res.set_null();
   } else {
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -118,88 +125,227 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
         ::oceanbase::share::server_service<::oceanbase::query::ObIAiEndpointResolver>();
     ObString model_id = arg_model_id->get_string();
     ObString query = arg_query->get_string();
-    ObArray<ObString> header_array;
     ObJsonArray *document_array = nullptr;
-    ObJsonArray *result_array = nullptr;
     ObIJsonBase *j_base = nullptr;
-    int64_t batch_size = 20; // max batch size for rerank
+    const int64_t batch_size = 20;
     bool is_null_result = false;
-    if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, DOCUMENTS_IDX,
-          j_base, is_null_result))) {
-    } else if (OB_ISNULL(j_base)) {
-      ret = OB_ERR_UNEXPECTED;
+    ObString doc_key;
+    bool has_doc_key = false;
+    if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+        ctx.exec_ctx_, temp_allocator, *arg_query,
+        expr.args_[QUERY_IDX]->datum_meta_,
+        expr.args_[QUERY_IDX]->obj_meta_.has_lob_header(), query))) {
+    } else if (OB_FAIL(ObJsonExprHelper::get_json_doc(
+        expr, ctx, temp_allocator, DOCUMENTS_IDX, j_base, is_null_result))) {
+    } else if (is_null_result || OB_ISNULL(j_base)) {
+      res.set_null();
+      ret = OB_ITER_END;
     } else if (j_base->json_type() != ObJsonNodeType::J_ARRAY) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, document_array is not array");
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, documents is not an array");
     } else if (OB_ISNULL(document_array = static_cast<ObJsonArray *>(j_base))) {
       ret = OB_ERR_UNEXPECTED;
     } else if (document_array->element_count() == 0) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, document_array is empty");
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, documents is empty");
+    } else if (expr.arg_cnt_ == 4 && OB_NOT_NULL(arg_doc_key) && !arg_doc_key->is_null()) {
+      has_doc_key = true;
+      if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+          ctx.exec_ctx_, temp_allocator, *arg_doc_key,
+          expr.args_[DOC_KEY_IDX]->datum_meta_,
+          expr.args_[DOC_KEY_IDX]->obj_meta_.has_lob_header(), doc_key))) {
+      } else if (doc_key.empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, document key is empty");
+      }
+    }
+
+    ObArray<ObString> document_texts;
+    if (OB_FAIL(ret)) {
+    } else if (model_id.empty() || query.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, model id or query is empty");
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < document_array->element_count(); i++) {
         ObJsonNode *doc_node = document_array->get_value(i);
         if (OB_ISNULL(doc_node)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (OB_NOT_NULL(arg_doc_key) && doc_node->json_type() != ObJsonNodeType::J_OBJECT) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (has_doc_key && doc_node->json_type() != ObJsonNodeType::J_OBJECT) {
           ret = OB_INVALID_ARGUMENT;
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, document_array element is not object");
-        } else if (OB_ISNULL(arg_doc_key) && doc_node->json_type() != ObJsonNodeType::J_STRING) {
+        } else if (!has_doc_key && doc_node->json_type() != ObJsonNodeType::J_STRING) {
           ret = OB_INVALID_ARGUMENT;
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, document_array element is not string");
+        } else if (has_doc_key) {
+          ObJsonNode *text_node = static_cast<ObJsonObject *>(doc_node)->get_value(doc_key);
+          if (OB_ISNULL(text_node) || text_node->json_type() != ObJsonNodeType::J_STRING) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                "ai_rerank, the value for the requested document key is not a string");
+          } else if (OB_FAIL(document_texts.push_back(
+              static_cast<ObJsonString *>(text_node)->get_str()))) {
+          }
+        } else if (OB_FAIL(document_texts.push_back(
+            static_cast<ObJsonString *>(doc_node)->get_str()))) {
         }
       }
     }
-    
+
     if (OB_FAIL(ret)) {
+    } else if (ret == OB_ITER_END) {
+      ret = OB_SUCCESS;
     } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(temp_allocator, model_id, info))) {
     } else if (OB_ISNULL(endpoint_resolver)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(
                    model_id, temp_allocator, resolved_endpoint))) {
-    } 
+    }
 
+    struct RankedResult
+    {
+      int64_t index_;
+      double score_;
+      ObJsonObject *result_;
+    };
+    ObArray<RankedResult> ranked_results;
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_doc_key)) {
-      ObString doc_key = arg_doc_key->get_string();
-      if (OB_FAIL(eval_ai_rerank_with_doc_key(expr, ctx, temp_allocator, model_id,
-                  query, document_array, doc_key, *info, *endpoint_info, res))) {
-      }
+    } else if (OB_FAIL(ObAIFuncUtils::check_info_type_rerank(info))) {
     } else {
-      if (OB_ISNULL(info)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else if (OB_FAIL(ObAIFuncUtils::check_info_type_rerank(info))) {
-      } else if (OB_FAIL(ObAIFuncUtils::get_header(temp_allocator, *info, *endpoint_info, header_array))) {
-      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(temp_allocator, result_array))) {
-      }
-
-      if (OB_SUCC(ret)) {
-        ObString score_key(SCORE_KEY);
-        int64_t end_idx = 0;
-        ObJsonArray *compact_array = nullptr;
-        ObJsonArray *batch_result_array = nullptr;
+      for (int64_t offset = 0; OB_SUCC(ret) && offset < document_texts.count();
+           offset += batch_size) {
+        int64_t end_idx = std::min(offset + batch_size, document_texts.count());
         ObJsonArray *batch_document_array = nullptr;
-        for (int64_t i = 0; OB_SUCC(ret) && i < document_array->element_count(); i += batch_size) {
-          end_idx = i + batch_size;
-          if (end_idx > document_array->element_count()) {
-            end_idx = document_array->element_count();
-          }
-          if (OB_FAIL(construct_batch_document_array(temp_allocator, document_array, i, end_idx, batch_document_array))) {
-          } else if (OB_FAIL(inner_eval_ai_rerank(temp_allocator, *info, *endpoint_info, header_array, query, batch_document_array, batch_result_array))) {
-          } else if (OB_FAIL(batch_result_add_base(temp_allocator, batch_result_array, i))) {
-          } else if (OB_FAIL(compact_json_array_by_key(temp_allocator, result_array, batch_result_array, score_key, compact_array))) {
-          } else {
-            result_array = compact_array;
+        ObJsonArray *batch_result_array = nullptr;
+        if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(temp_allocator, batch_document_array))) {
+        }
+        for (int64_t i = offset; OB_SUCC(ret) && i < end_idx; i++) {
+          ObJsonString *doc_str = nullptr;
+          if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(
+              temp_allocator, document_texts.at(i), doc_str))) {
+          } else if (OB_FAIL(batch_document_array->append(doc_str))) {
           }
         }
-      }
-      if (OB_SUCC(ret)) {
-        ObString raw_str;
-        if (OB_FAIL(result_array->get_raw_binary(raw_str, &temp_allocator))) {
-        } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, res, raw_str))) {
+        ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(model.call_rerank(query, batch_document_array, batch_result_array))) {
+        } else if (OB_ISNULL(batch_result_array)
+            || batch_result_array->element_count() != end_idx - offset) {
+          ret = OB_INVALID_DATA;
+          LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank returned an unexpected result count");
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < batch_result_array->element_count(); i++) {
+            ObJsonNode *result_node = batch_result_array->get_value(i);
+            ObJsonObject *result_obj = nullptr;
+            ObJsonNode *index_node = nullptr;
+            ObJsonNode *score_node = nullptr;
+            RankedResult ranked_result;
+            if (OB_ISNULL(result_node)
+                || result_node->json_type() != ObJsonNodeType::J_OBJECT
+                || OB_ISNULL(result_obj = static_cast<ObJsonObject *>(result_node))
+                || OB_ISNULL(index_node = result_obj->get_value(INDEX_KEY))
+                || OB_ISNULL(score_node = result_obj->get_value(SCORE_KEY))
+                || index_node->json_type() != ObJsonNodeType::J_INT
+                || (score_node->json_type() != ObJsonNodeType::J_INT
+                    && score_node->json_type() != ObJsonNodeType::J_DOUBLE)) {
+              ret = OB_INVALID_DATA;
+              LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank returned an invalid result item");
+            } else {
+              int64_t local_index = static_cast<ObJsonInt *>(index_node)->get_int();
+              if (local_index < 0 || local_index >= end_idx - offset) {
+                ret = OB_INVALID_DATA;
+                LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank returned an invalid document index");
+              } else {
+                ranked_result.index_ = offset + local_index;
+                ranked_result.score_ =
+                    score_node->json_type() == ObJsonNodeType::J_INT
+                        ? static_cast<double>(static_cast<ObJsonInt *>(score_node)->get_int())
+                        : static_cast<ObJsonDouble *>(score_node)->value();
+                if (!std::isfinite(ranked_result.score_)) {
+                  ret = OB_INVALID_DATA;
+                  LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank returned a non-finite score");
+                } else {
+                  ranked_result.result_ = result_obj;
+                  if (OB_FAIL(ranked_results.push_back(ranked_result))) {
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
+
+    ObArray<bool> seen_indexes;
+    if (OB_FAIL(ret)) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < document_texts.count(); i++) {
+        if (OB_FAIL(seen_indexes.push_back(false))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < ranked_results.count(); i++) {
+        int64_t index = ranked_results.at(i).index_;
+        if (index < 0 || index >= seen_indexes.count() || seen_indexes.at(index)) {
+          ret = OB_INVALID_DATA;
+          LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank returned duplicate document indexes");
+        } else {
+          seen_indexes.at(index) = true;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        lib::ob_sort(ranked_results.begin(), ranked_results.end(),
+            [](const RankedResult &left, const RankedResult &right) {
+              if (left.score_ != right.score_) {
+                return left.score_ > right.score_;
+              }
+              return left.index_ < right.index_;
+            });
+      }
+    }
+
+    ObJsonArray *result_array = nullptr;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(temp_allocator, result_array))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ranked_results.count(); i++) {
+        const RankedResult &ranked = ranked_results.at(i);
+        if (has_doc_key) {
+          ObJsonObject *origin_obj =
+              static_cast<ObJsonObject *>(document_array->get_value(ranked.index_));
+          ObJsonObject *new_obj = nullptr;
+          ObJsonNode *model_score = nullptr;
+          if (OB_ISNULL(origin_obj)
+              || OB_ISNULL(new_obj = static_cast<ObJsonObject *>(
+                  origin_obj->clone(&temp_allocator, true)))
+              || OB_ISNULL(model_score = ranked.result_->get_value(SCORE_KEY))) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            ObJsonNode *score_copy = model_score->clone(&temp_allocator, true);
+            if (OB_ISNULL(score_copy)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else if (OB_FAIL(new_obj->add(MODEL_SCORE_KEY, score_copy))) {
+            } else if (OB_FAIL(result_array->append(new_obj))) {
+            }
+          }
+        } else {
+          ObJsonNode *index_node = ranked.result_->get_value(INDEX_KEY);
+          if (OB_ISNULL(index_node)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FALSE_IT(
+              static_cast<ObJsonInt *>(index_node)->set_value(ranked.index_))) {
+          } else if (OB_FAIL(result_array->append(ranked.result_))) {
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObString raw_str;
+      if (OB_FAIL(result_array->get_raw_binary(raw_str, &temp_allocator))) {
+      } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, res, raw_str))) {
+      }
+    }
+  }
+  if (ret == OB_ITER_END) {
+    ret = OB_SUCCESS;
   }
   return ret;
 }
