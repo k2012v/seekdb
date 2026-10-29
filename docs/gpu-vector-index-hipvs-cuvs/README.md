@@ -59,6 +59,39 @@ Build seekdb with the resulting library:
   --make -j64
 ```
 
+## Build tuning
+
+The bridge uses one set of CAGRA build parameters for the contest shapes
+(250K rows, L2, FP32). It keeps Recall within 0.005 of the frozen baseline on
+both SIFT-like and uniform-random data:
+
+| dimension | graph degree | intermediate degree | NN-descent iterations |
+| --- | ---: | ---: | ---: |
+| `<= 128` | 128 | 256 | 40 |
+| `> 128` | 128 | 256 | 40 |
+
+Search keeps `itopk=512` and `search_width=4`. The bridge also reuses one
+`cuvsCagraSearchParams` object and its device buffers per index handle, which
+removes the per-query allocation/copy overhead without changing search
+semantics.
+
+Every knob can be overridden for sweeps (the evaluation harness does not set
+these):
+
+```text
+SEEKDB_CUVS_GRAPH_DEGREE
+SEEKDB_CUVS_INTERMEDIATE_GRAPH_DEGREE
+SEEKDB_CUVS_NN_DESCENT_NITER
+SEEKDB_CUVS_SEARCH_ITOPK
+SEEKDB_CUVS_SEARCH_WIDTH
+SEEKDB_CUVS_SEARCH_MAX_QUERIES
+```
+
+See [`build-optimization-report.md`](build-optimization-report.md) for the
+paired measurements, rejected configurations, and reproduction steps, and
+[`tools/hipvs_bridge/bench`](../../tools/hipvs_bridge/bench) for the
+seekdb-independent benchmark.
+
 For a CPU-only build, leave the defaults or pass:
 
 ```bash
@@ -129,9 +162,12 @@ The no-GPU DDL contract remains covered by
 ## Current limitations
 
 - Phase 1 supports dense float32 L2 indexes only.
-- GPU indexes are process-local and rebuilt lazily; persistence and cache reuse
-  are follow-up work.
+- GPU indexes are process-local. The V5 baseline persists a CAGRA snapshot on
+  DDL and reloads it on first query; this change keeps that path (and does not
+  reuse snapshots across builds) while reducing its temporary-file I/O.
 - The explicit batch API rebuilds its CAGRA index per call.
+- Build-parameter defaults are tuned on a proxy GPU for 250K-row workloads;
+  confirm the absolute speedup on the target Radeon PRO W7900D.
 - GPU validation is manual because upstream CI has no compatible GPU runner.
 - Multi-GPU, long-duration, and snapshot-reload coverage are out of scope for
   this phase.

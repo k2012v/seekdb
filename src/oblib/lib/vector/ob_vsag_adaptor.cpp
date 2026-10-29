@@ -30,6 +30,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/statvfs.h>
 #include <pthread.h>
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
@@ -321,13 +323,61 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
 }
 
 static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
+static uint64_t ob_cuvs_shm_available_bytes() {
+  struct statvfs vfs;
+  if (::statvfs("/dev/shm", &vfs) != 0) { return 0; }
+  return static_cast<uint64_t>(vfs.f_bavail) * static_cast<uint64_t>(vfs.f_frsize);
+}
+// Upper bound for the cuVS blob (dataset + IDs + a 320-degree graph) plus slack.
+// Used only to decide whether a RAM-backed temp file is safe; a failed write
+// still falls back to a disk-backed tmpfile.
+static size_t ob_cuvs_snapshot_upper_bound(size_t n, size_t dim) {
+  return n * dim * sizeof(float) + n * sizeof(int64_t) +
+         n * 320UL * sizeof(uint32_t) + (64UL << 20);
+}
 struct ObCuvsSnapshotFile {
-  FILE *file_ = ::tmpfile();
+  FILE *file_ = nullptr;
   char path_[64] = {};
-  ObCuvsSnapshotFile() {
+  bool shm_ = false;
+  explicit ObCuvsSnapshotFile(size_t expected_bytes) {
+    // Prefer a RAM-backed file: the CAGRA blob is written during the timed
+    // build. Containers often mount a tiny /dev/shm (64MB by default), so only
+    // use it when it can hold the whole snapshot; otherwise use a disk tmpfile.
+    char tmpl[64];
+    int len = ::snprintf(tmpl, sizeof(tmpl), "/dev/shm/seekdb_cuvs_XXXXXX");
+    if (len > 0 && len < static_cast<int>(sizeof(tmpl)) &&
+        static_cast<uint64_t>(expected_bytes) < ob_cuvs_shm_available_bytes()) {
+      int fd = ::mkstemp(tmpl);
+      if (fd >= 0) {
+        ::unlink(tmpl);
+        if (::snprintf(path_, sizeof(path_), "/proc/self/fd/%d", fd) <
+            static_cast<int>(sizeof(path_))) {
+          file_ = ::fdopen(fd, "w+b");
+        }
+        if (file_ == nullptr) {
+          ::close(fd);
+          path_[0] = '\0';
+        } else {
+          shm_ = true;
+        }
+      }
+    }
+    if (file_ == nullptr) {
+      file_ = ::tmpfile();
+    }
     if (file_ != nullptr) {
       ::snprintf(path_, sizeof(path_), "/proc/self/fd/%d", ::fileno(file_));
     }
+  }
+  bool reopen_on_disk() {
+    if (file_ != nullptr) { ::fclose(file_); file_ = nullptr; }
+    path_[0] = '\0';
+    shm_ = false;
+    file_ = ::tmpfile();
+    if (file_ != nullptr) {
+      ::snprintf(path_, sizeof(path_), "/proc/self/fd/%d", ::fileno(file_));
+    }
+    return file_ != nullptr;
   }
   ~ObCuvsSnapshotFile() { if (file_ != nullptr) { ::fclose(file_); } }
   ObCuvsSnapshotFile(const ObCuvsSnapshotFile &) = delete;
@@ -405,9 +455,18 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     ent->bridge_ = nb; ent->built_n_ = n; ent->ids_ = ent->buf_ids_;
     built = true;
   }
-  ObCuvsSnapshotFile graph;
+  ObCuvsSnapshotFile graph(ob_cuvs_snapshot_upper_bound(n, static_cast<size_t>(ent->dim_)));
   ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1};
-  if (graph.file_ == nullptr || !ob_cuvs_snapshot_big_stack(job) ||
+  bool snapshot_ok = graph.file_ != nullptr && ob_cuvs_snapshot_big_stack(job);
+  if (!snapshot_ok && graph.shm_) {
+    LOG_WARN("[OBVSAG][cuVS] /dev/shm snapshot failed; retrying on disk", KP(key), K(n));
+    if (graph.reopen_on_disk()) {
+      job = ObCuvsSnapshotJob{graph.path_, ent->bridge_.get(), static_cast<long>(n),
+                              ent->dim_, false, -1};
+      snapshot_ok = ob_cuvs_snapshot_big_stack(job);
+    }
+  }
+  if (!snapshot_ok ||
       ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
     ret = OB_ERR_VSAG_RETURN_ERROR;
     return true;
@@ -474,7 +533,7 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
     } else {
-      ObCuvsSnapshotFile graph;
+      ObCuvsSnapshotFile graph(static_cast<size_t>(graph_bytes));
       std::vector<char> chunk(65536);
       uint64_t remaining = graph_bytes;
       while (graph.file_ != nullptr && remaining > 0) {
